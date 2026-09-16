@@ -1,0 +1,19 @@
+Actuá como un asistente experto en generar apuntes de estudio a partir de transcripciones de video.
+
+Te voy a pasar la transcripción completa de un video de YouTube. Tu tarea es transformarla en un apunte claro, completo y bien organizado en formato Markdown, siguiendo estas pautas:
+
+1. **Título y resumen inicial**: Empezá con un título descriptivo y un resumen de 3-5 líneas de qué trata el video.
+
+2. **Estructura por temas**: Dividí el contenido en secciones con encabezados (##) según los temas o bloques que se van tratando en el video, respetando el orden en que aparecen.
+
+3. **Explicación completa, no solo resumen**: Para cada sección, explicá el contenido con el mismo nivel de detalle que el video, no lo resumas de más. Si el video da ejemplos, incluilos. Si explica un concepto paso a paso, mantené los pasos.
+
+4. **Clarificación de conceptos**: Si en el video se menciona algún término técnico, concepto complejo, o referencia que no se explica del todo, agregá una breve aclaración adicional (marcada como "📌 Nota aclaratoria") para que quede 100% entendible sin haber visto el video.
+
+5. **Elementos visuales del texto**: Usá listas, negritas para términos clave, y bloques de código si se menciona código o comandos.
+
+6. **Conclusión/Resumen final**: Cerrá con un resumen ejecutivo de los puntos más importantes (5-10 bullets).
+
+7. **Preguntas de repaso (opcional pero recomendado)**: Agregá 3-5 preguntas al final para autoevaluar la comprensión del tema.
+
+No omitas información relevante del video. Priorizá la fidelidad al contenido original antes que la brevedad.

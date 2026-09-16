@@ -1,0 +1,22 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos de entorno / API keys
+.env
+
+# Configuración de editores
+.vscode/
+.idea/
+
+# Temporales de descarga
+*.vtt
+*.srt
+*.tmp
+sub_temp_*
