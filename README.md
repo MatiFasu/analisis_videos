@@ -24,17 +24,19 @@ Herramienta automatizada en Python para extraer transcripciones de videos de You
 
 ```text
 analisis_videos/
+├── apuntes/                        # Directorio principal donde se almacenan todos los apuntes
+│   └── <nombre_del_apunte>/        # Carpeta creada para cada materia o tema de apunte
+│       ├── 01_<titulo>_transcripcion.txt
+│       ├── 01_<titulo>_portada.jpg
+│       ├── 01_<titulo>.md
+│       └── 01_<titulo>.pdf
+├── enriquecedor_visual.py          # Renderizado de diagramas Mermaid y portadas HD
 ├── generar_apunte.py               # Script principal de automatización
 ├── iniciar.bat                     # Acceso directo para Windows (doble clic)
 ├── prompt.txt                      # Plantilla con directrices pedagógicas para Gemini
 ├── requirements.txt                # Dependencias del proyecto
 ├── plan_de_accion_automatizacion.md# Especificación técnica y plan de desarrollo
-├── .gitignore
-│
-└── <materia>/                      # Carpeta generada automáticamente según el tema
-    ├── 01_<titulo>_transcripcion.txt
-    ├── 01_<titulo>.md
-    └── 01_<titulo>.pdf
+└── .gitignore
 ```
 
 ---
@@ -55,18 +57,35 @@ pip install -r requirements.txt
 ## 🚀 Modos de Uso
 
 ### Modo 1: Asistido con Doble Clic (Windows)
-1. Hacé doble clic en `iniciar.bat`.
-2. Ingresá la URL del video de YouTube cuando te lo solicite.
-3. Indicá la materia o categoría (ej: `matematica`).
-4. Seleccioná si deseás generar también el archivo en PDF (`s/n`).
+1. Hacé doble clic en [`iniciar.bat`](file:///C:/Users/matia/Downloads/analisis_videos/iniciar.bat).
+2. Podés procesar videos de dos formas:
+   - **Video único:** Pegás la URL directamente.
+   - **Múltiples videos (Lote):**
+     - O pegás la lista de URLs en el archivo [`urls.txt`](file:///C:/Users/matia/Downloads/analisis_videos/urls.txt) (una por línea). Al iniciar, el programa te preguntará si querés procesarlas automáticamente.
+     - O ingresás por consola la ruta a un archivo de texto (ej. `clases.txt`) o varias URLs separadas por coma.
+3. **IDs manuales o automáticos:**
+   - Si ponés `clase 1 -> URL` o `clase 2 URL`, se asignará el número exacto (`01`, `02`, etc.).
+   - Si no ponés nada antes de la URL, el sistema asigna la numeración correlativa automáticamente.
+4. Indicá el nombre de la materia/carpeta (ej: `teoria_de_juegos`). Todos los videos del lote irán a esa misma carpeta.
+5. Seleccioná si deseás generar también el archivo en PDF (`s/n`).
+6. ¡Listo! El material quedará organizado dentro de `apuntes/<nombre_del_apunte>/`.
 
 ### Modo 2: Línea de Comandos
 ```powershell
-python generar_apunte.py --url "https://www.youtube.com/watch?v=XXXXXX" --materia "matematica" --pdf
+# Un solo video con ID automático:
+python generar_apunte.py --url "https://www.youtube.com/watch?v=XXXXXX" --apunte "teoria_de_juegos" --pdf
+
+# Múltiples videos desde urls.txt o archivo personalizado:
+python generar_apunte.py --urls-file "urls.txt" --apunte "teoria_de_juegos" --pdf
+
+# Varios videos indicados en línea de comandos (con o sin clase):
+python generar_apunte.py --url "clase 1 -> https://..." "clase 2 -> https://..." --apunte "teoria_de_juegos" --pdf
 ```
 
 ### Argumentos Opcionales:
-- `--url`, `-u`: URL o ID del video de YouTube.
-- `--materia`, `-m`: Nombre de la carpeta/materia donde guardar el material.
+- `--url`, `-u`: Una o varias URLs / IDs de videos de YouTube (acepta prefijo `clase X ->`).
+- `--urls-file`, `--file`, `-f`: Ruta a un archivo `.txt` con lista de URLs.
+- `--apunte`, `--materia`, `-m`: Nombre de la carpeta/apunte dentro de `apuntes/`.
+- `--dir-apuntes`: Directorio base para los apuntes (por defecto: `apuntes`).
 - `--pdf`: Genera además la versión compilada en formato PDF.
 - `--model`: Permite elegir un modelo específico (ej. `gemini-3.8-flash-low`, `gemini-2.5-flash`).

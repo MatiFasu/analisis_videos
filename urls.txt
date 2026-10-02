@@ -1,0 +1,73 @@
+# ============================================================================
+# urls.txt - Lista de videos de YouTube para procesar en lote
+# ============================================================================
+# Pegá aquí las URLs de los videos (uno por línea) de una misma categoría.
+#
+# Podés asignar el ID o número de clase manualmente si querés:
+#   clase 1 -> https://www.youtube.com/watch?v=...
+#   clase 2 -> https://www.youtube.com/watch?v=...
+#   3: https://www.youtube.com/watch?v=...
+#   04 | https://www.youtube.com/watch?v=...
+#
+# O podés poner directamente la URL limpia y el sistema asignará el número automático:
+#   https://www.youtube.com/watch?v=...
+#   https://youtu.be/...
+#
+# Las líneas vacías o que comiencen con '#' son ignoradas.
+# ============================================================================
+
+clase 1 https://youtu.be/hE4l9WyLF3U?si=jhIatJKHBlH1Nv1y
+
+clase 2 https://youtu.be/kS-muAuq62E?si=OoLdDQQQBZ-XdVOY
+
+clase 3 https://youtu.be/MX93U4KzA28?si=Q8us8CjNAwEpHnuj
+
+clase 4 https://youtu.be/35HRPLVyF0g?si=NriAabcG9mwSOW7S
+
+clase 5 https://youtu.be/ybufqRY77PQ?si=F_vT7WEvx8ALi5ze
+
+clase 6 https://youtu.be/CbamEcNuDXo?si=1An9IlNNl9vHHX5A
+
+clase 7 https://youtu.be/ijnkCt1QK6k?si=qGBinwIdiHOXv6Ku
+
+clase 8 https://youtu.be/axqDLhWs93Q?si=AyQCRFYYZP0KUJXd
+
+clase 9 https://youtu.be/jIS2eB-rGv0?si=te3af9BYqUk7uioH
+ 
+clase 10 https://youtu.be/t5oisJiorsU?si=U6MKuI5xAn8B_qTY
+
+clase 11 https://youtu.be/fz-Dan7NRss?si=M-suGhRTRwhXFCoa
+
+clase 12 https://youtu.be/spg58Glfz68?si=EHohaCBAIFfc6SEJ
+
+clase 13 https://youtu.be/aQSDSqdlFxk?si=OmJGv97tm3Q3rZNv
+
+clase 14 https://youtu.be/nOQqGy4boBY?si=ngurj0QfXq7jkMuE
+
+clase 15 https://youtu.be/zAer-Mqe7tQ?si=WKrECG46fJLS1-DG
+
+clase 16 https://youtu.be/mk4vcHtawSo?si=drV_Wqz7YuI4_dbm
+
+clase 17 https://youtu.be/VbowBTJWKBo?si=tylVFD4MftedzdZe
+
+clase 18 https://youtu.be/xrmERlHUqBk?si=-NQDDk05jZD5-dj0
+
+clase 19 https://youtu.be/0HYET47Cc-E?si=L5i35Ao7KDZcFqZD
+
+clase 20 https://youtu.be/ue8y5e3HnHE?si=gUtyCovEdsV_t54g
+
+clase 21 https://youtu.be/Ts-AA6LQf6I?si=FDQ5BziDWB1sA7Eq
+
+clase 22 https://youtu.be/txgPfnXgzcE?si=NJObnoacNAIFIxPd
+
+clase 23 https://youtu.be/6aNh6sBpqvQ?si=LEXNzcrPw2kCGZN2
+
+clase 24 https://youtu.be/8nsxuB3Vsts?si=Frc0QQVoutJg1XWI
+
+clase 25 https://youtu.be/BIl5vJn6ohI?si=e5AOOksKZInp4gA_
+
+clase 26 https://youtu.be/RG1clZlrfOo?si=4whunnXlFnIDBQBp
+
+clase 27 https://youtu.be/x83HcLWvHI8?si=ojoVcGf6PCPaZ8E4
+
+clase 28 https://youtu.be/dja6dkCfngE?si=xvWypDT17KYAzBDK

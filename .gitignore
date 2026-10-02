@@ -20,3 +20,6 @@ __pycache__/
 *.srt
 *.tmp
 sub_temp_*
+
+# Apuntes generados
+apuntes/
