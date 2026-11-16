@@ -12,8 +12,8 @@ Módulo dedicado a la gestión visual de apuntes:
 
 import os
 import re
+import time
 import base64
-import tempfile
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -279,7 +279,7 @@ def extraer_titulo_diagrama(codigo: str, indice: int, texto_previo: str = "") ->
 
     # 2. Si el bloque de texto previo tiene un subtítulo (### Mi Título)
     if texto_previo:
-        lineas_previas = [l.strip() for l in texto_previo.strip().splitlines() if l.strip()]
+        lineas_previas = [item.strip() for item in texto_previo.strip().splitlines() if item.strip()]
         if lineas_previas:
             ultima_linea = lineas_previas[-1]
             match_header = re.match(r'^#{1,6}\s*(.+)$', ultima_linea)
@@ -378,24 +378,27 @@ def procesar_diagramas_mermaid(contenido_markdown: str) -> str:
             codigo_final = codigo_sanitizado
 
         reemplazo = None
-        try:
-            encoded = base64.urlsafe_b64encode(codigo_final.encode("utf-8")).decode("ascii")
-            url = f"https://mermaid.ink/img/{encoded}"
-            # Solicitar imagen PNG nítida con fondo blanco
-            res = requests.get(url, params={"format": "png", "bgColor": "FFFFFF", "width": 1200}, timeout=15)
+        encoded = base64.urlsafe_b64encode(codigo_final.encode("utf-8")).decode("ascii")
+        url = f"https://mermaid.ink/img/{encoded}"
 
-            if res.status_code == 200 and len(res.content) > 200:
-                img_bytes_recortadas = recortar_bordes_blancos(res.content)
-                b64_img = base64.b64encode(img_bytes_recortadas).decode("ascii")
-                data_uri = f"data:image/png;base64,{b64_img}"
-                reemplazo = (
-                    f'\n\n<div class="figura-diagrama-contenedor" style="text-align: center; margin: 18px 0;">'
-                    f'<img src="{data_uri}" alt="Figura {num_figura}: {titulo_figura}" class="figura-diagrama-img" style="max-width: 95%; height: auto; border: 1px solid #cbd5e1; border-radius: 6px;" />'
-                    f'<p class="figure-caption">Figura {num_figura}: {titulo_figura}</p>'
-                    f'</div>\n\n'
-                )
-        except Exception:
-            pass
+        # Reintentos con retroceso para solicitar imagen PNG nítida con fondo blanco
+        for intento in range(1, 4):
+            try:
+                res = requests.get(url, params={"format": "png", "bgColor": "FFFFFF", "width": 1200}, timeout=15)
+                if res.status_code == 200 and len(res.content) > 200:
+                    img_bytes_recortadas = recortar_bordes_blancos(res.content)
+                    b64_img = base64.b64encode(img_bytes_recortadas).decode("ascii")
+                    data_uri = f"data:image/png;base64,{b64_img}"
+                    reemplazo = (
+                        f'\n\n<div class="figura-diagrama-contenedor" style="text-align: center; margin: 18px 0;">'
+                        f'<img src="{data_uri}" alt="Figura {num_figura}: {titulo_figura}" class="figura-diagrama-img" style="max-width: 95%; height: auto; border: 1px solid #cbd5e1; border-radius: 6px;" />'
+                        f'<p class="figure-caption">Figura {num_figura}: {titulo_figura}</p>'
+                        f'</div>\n\n'
+                    )
+                    break
+            except Exception:
+                if intento < 3:
+                    time.sleep(1.0 * intento)
 
         if not reemplazo:
             reemplazo = f"\n\n```text\n{codigo_original}\n```\n<p class=\"figure-caption\">Figura {num_figura}: {titulo_figura}</p>\n\n"

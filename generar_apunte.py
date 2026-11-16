@@ -11,16 +11,16 @@ import os
 import sys
 import re
 import json
+import random
+import logging
 import argparse
 import unicodedata
 import subprocess
 import tempfile
-import base64
 import time
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Callable, Any, Union
 import urllib.request
 import urllib.error
-import requests
 import enriquecedor_visual
 
 # Forzar codificación UTF-8 en stdout y stderr para Windows
@@ -30,6 +30,370 @@ if sys.stdout.encoding != 'utf-8':
         sys.stderr.reconfigure(encoding='utf-8')
     except AttributeError:
         pass
+
+# Logger global
+logger = logging.getLogger("generar_apunte")
+
+
+def configurar_logging(verbose: bool = False, archivo_log: Optional[str] = None):
+    """Configura logging estructurado con marcas de tiempo y niveles."""
+    nivel = logging.DEBUG if verbose else logging.INFO
+    formato = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%H:%M:%S"
+
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if archivo_log:
+        handlers.append(logging.FileHandler(archivo_log, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=nivel,
+        format=formato,
+        datefmt=datefmt,
+        handlers=handlers,
+        force=True
+    )
+
+
+def reintentar_con_backoff(
+    func: Callable[[], Any],
+    max_intentos: int = 3,
+    base_delay: float = 2.0,
+    max_delay: float = 25.0,
+    descripcion: str = "operación",
+    excepciones_reintentables: Tuple[type, ...] = (Exception,)
+) -> Any:
+    """
+    Ejecuta una función reintentando con retroceso exponencial y jitter si falla.
+    """
+    ultimo_error = None
+    for intento in range(1, max_intentos + 1):
+        try:
+            return func()
+        except excepciones_reintentables as e:
+            ultimo_error = e
+            if intento == max_intentos:
+                logger.error(f"❌ Falló '{descripcion}' tras {max_intentos} intentos: {e}")
+                raise
+            demora = min(max_delay, base_delay * (2 ** (intento - 1))) + random.uniform(0.1, 0.8)
+            logger.warning(
+                f"⚠️ Intento {intento}/{max_intentos} de '{descripcion}' falló ({e}). "
+                f"Reintentando en {demora:.1f}s..."
+            )
+            time.sleep(demora)
+    raise ultimo_error
+
+
+def decodificar_bytes_salida(datos: Union[bytes, str, None]) -> str:
+    """Decodifica bytes a texto probando utf-8, cp1252 y fallback con reemplazo."""
+    if not datos:
+        return ""
+    if isinstance(datos, str):
+        return datos
+    for codificacion in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return datos.decode(codificacion)
+        except UnicodeDecodeError:
+            continue
+    return datos.decode("utf-8", errors="replace")
+
+
+def ejecutar_subproceso_texto(
+    cmd: List[str],
+    timeout: Optional[int] = None,
+    env: Optional[Dict[str, str]] = None
+) -> Tuple[int, str, str]:
+    """
+    Ejecuta un subproceso de forma segura contra problemas de decodificación en Windows.
+    Captura bytes crudos para evitar que _readerthread de Python falle con UnicodeDecodeError.
+    Devuelve (returncode, stdout_str, stderr_str).
+    """
+    entorno = os.environ.copy()
+    entorno["PYTHONIOENCODING"] = "utf-8"
+    if env:
+        entorno.update(env)
+
+    proceso = subprocess.run(
+        cmd,
+        capture_output=True,
+        timeout=timeout,
+        env=entorno
+    )
+    salida = decodificar_bytes_salida(proceso.stdout)
+    error = decodificar_bytes_salida(proceso.stderr)
+    return proceso.returncode, salida, error
+
+
+def es_url_playlist(url: str) -> bool:
+    """Detecta si la URL provista corresponde a una lista de reproducción (contiene list=)."""
+    if not url:
+        return False
+    return bool(re.search(r'[?&]list=([a-zA-Z0-9_-]+)', url.strip()))
+
+
+def extraer_id_playlist(url: str) -> Optional[str]:
+    """Extrae el identificador de la playlist (parámetro list=)."""
+    m = re.search(r'[?&]list=([a-zA-Z0-9_-]+)', url.strip())
+    return m.group(1) if m else None
+
+
+def parsear_salida_playlist_ytdlp(salida_texto: str) -> List[Tuple[int, str, str]]:
+    """
+    Parsea la salida de `yt-dlp --flat-playlist --print "%(playlist_index)s|%(id)s|%(title)s"`.
+    Devuelve lista de tuplas ordenadas (indice_playlist, video_id, titulo).
+    """
+    videos = []
+    for linea in salida_texto.strip().splitlines():
+        linea = linea.strip()
+        if not linea or "|" not in linea:
+            continue
+        partes = linea.split("|", 2)
+        if len(partes) == 3:
+            raw_idx, vid, tit = partes
+            try:
+                idx = int(raw_idx)
+            except ValueError:
+                idx = len(videos) + 1
+            vid = vid.strip()
+            tit = tit.strip() or f"Video_{vid}"
+            if len(vid) == 11:
+                videos.append((idx, vid, tit))
+    videos.sort(key=lambda x: x[0])
+    return videos
+
+
+def obtener_videos_de_playlist(
+    url_playlist: str,
+    desde: Optional[int] = None,
+    hasta: Optional[int] = None
+) -> Tuple[str, List[Tuple[int, str, str]]]:
+    """
+    Llama a `yt-dlp --flat-playlist --print "%(playlist_title)s|%(playlist_index)s|%(id)s|%(title)s"`
+    sin descargar videos ni audio, y devuelve el título de la playlist y la lista ordenada
+    de videos [(indice_playlist, video_id, titulo), ...].
+    """
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--print", "%(playlist_title)s|%(playlist_index)s|%(id)s|%(title)s"
+    ]
+
+    # Aplicar rango directo en yt-dlp si se especificó
+    if desde is not None or hasta is not None:
+        d_str = str(desde) if desde is not None else "1"
+        h_str = str(hasta) if hasta is not None else ""
+        cmd.extend(["--playlist-items", f"{d_str}:{h_str}"])
+
+    cmd.append(url_playlist)
+
+    logger.debug(f"Ejecutando yt-dlp para playlist: {' '.join(cmd)}")
+    try:
+        retcode, salida, err = ejecutar_subproceso_texto(cmd, timeout=45)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("La consulta de la playlist a YouTube excedió el tiempo límite (45s).")
+
+    if retcode != 0:
+        err = err.strip()
+        if "private" in err.lower():
+            raise ValueError("La playlist es privada o requiere inicio de sesión.")
+        elif "does not exist" in err.lower() or "not found" in err.lower():
+            raise ValueError("La playlist no existe o fue eliminada.")
+        raise ValueError(f"No se pudo consultar la playlist con yt-dlp: {err}")
+
+    salida = salida.strip()
+    if not salida:
+        raise ValueError("La playlist no contiene videos accesibles o está vacía.")
+
+    titulo_playlist = "Playlist"
+    videos: List[Tuple[int, str, str]] = []
+
+    for linea in salida.splitlines():
+        linea = linea.strip()
+        if not linea or "|" not in linea:
+            continue
+        partes = linea.split("|", 3)
+        if len(partes) == 4:
+            pltit, raw_idx, vid, tit = partes
+            if pltit and pltit.strip() and pltit.strip() != "NA":
+                titulo_playlist = pltit.strip()
+            try:
+                idx = int(raw_idx)
+            except ValueError:
+                idx = len(videos) + 1
+            vid = vid.strip()
+            tit = tit.strip() or f"Video_{vid}"
+            if len(vid) == 11:
+                videos.append((idx, vid, tit))
+
+    # Filtrar en memoria por consistencia
+    if desde is not None:
+        videos = [v for v in videos if v[0] >= desde]
+    if hasta is not None:
+        videos = [v for v in videos if v[0] <= hasta]
+
+    videos.sort(key=lambda x: x[0])
+    return titulo_playlist, videos
+
+
+def parsear_rango_interactivo(entrada: str, total_disponible: int) -> Tuple[bool, Optional[Tuple[int, int]]]:
+    """
+    Parsea la selección de cantidad o rango de videos en modo interactivo.
+    Devuelve (continuar: bool, rango: Optional[Tuple[desde, hasta]]).
+    Si continuar es False, se cancela la operación.
+    """
+    texto = entrada.strip().lower()
+    if not texto or texto in ["s", "si", "sí", "y", "yes", "todos", "todas", "t"]:
+        return True, (1, total_disponible)
+
+    if texto in ["n", "no", "cancelar", "cancel", "salir", "exit", "q"]:
+        return False, None
+
+    # Caso: rango con separadores "-", "a", "al", ":", ".."
+    m_rango = re.match(r'^(\d+)\s*(?:-|a|al|:|\.\.)\s*(\d+)$', texto)
+    if m_rango:
+        d = int(m_rango.group(1))
+        h = int(m_rango.group(2))
+        d = max(1, d)
+        h = min(total_disponible, h)
+        if d > h:
+            d, h = h, d
+        return True, (d, h)
+
+    # Caso: "desde X"
+    if texto.startswith("desde"):
+        m = re.match(r'^desde\s*(\d+)$', texto)
+        if m:
+            d = max(1, min(int(m.group(1)), total_disponible))
+            return True, (d, total_disponible)
+
+    # Caso: "hasta X"
+    if texto.startswith("hasta"):
+        m = re.match(r'^hasta\s*(\d+)$', texto)
+        if m:
+            h = max(1, min(int(m.group(1)), total_disponible))
+            return True, (1, h)
+
+    # Caso: un único número N (cantidad de videos a procesar desde el 1)
+    if texto.isdigit():
+        n = int(texto)
+        if n <= 0:
+            return False, None
+        h = min(total_disponible, n)
+        return True, (1, h)
+
+    return True, (1, total_disponible)
+
+
+def resolver_y_expandir_entradas(
+    entradas_crudas: List[Tuple[Optional[str], str]],
+    video_only: bool = False,
+    desde: Optional[int] = None,
+    hasta: Optional[int] = None,
+    es_interactivo: bool = False
+) -> Tuple[Optional[str], List[Tuple[Optional[str], str]]]:
+    """
+    Auto-detecta playlists en cualquier entrada y las expande a sus videos ordenados,
+    respetando playlist_index para la numeración y rangos (--desde / --hasta).
+    Devuelve (materia_sugerida, lista_expandida_de_pares_id_url).
+    """
+    lista_final: List[Tuple[Optional[str], str]] = []
+    materia_sugerida: Optional[str] = None
+
+    for cid_orig, url in entradas_crudas:
+        if not url:
+            continue
+
+        if es_url_playlist(url) and not video_only:
+            try:
+                print("🔍 Consultando playlist en YouTube...")
+                titulo_pl, videos_pl = obtener_videos_de_playlist(url, desde=desde, hasta=hasta)
+                if not materia_sugerida and titulo_pl:
+                    materia_sugerida = titulo_pl
+
+                total_pl = len(videos_pl)
+                rango_txt = f"{desde or 1} al {hasta or total_pl}" if (desde or hasta) else f"1 al {total_pl}"
+                print(f"\n📋 Se detectaron {total_pl} videos en la playlist '{titulo_pl}' (rango: {rango_txt}).")
+
+                if es_interactivo and len(entradas_crudas) == 1 and (desde is None and hasta is None):
+                    try:
+                        print("\n👉 ¿Cuántos videos querés procesar de la playlist?")
+                        print(f"   • Presioná [Enter] para procesar todos (1 al {total_pl})")
+                        print("   • O ingresá una cantidad (ej: 3 para procesar del 1 al 3)")
+                        print("   • O un rango específico (ej: 1-5 o 10 al 20)")
+                        print("   • 'n' para cancelar")
+                        resp = input(f"Opción [Enter = todos ({total_pl})]: ").strip()
+                        continuar, rango_sel = parsear_rango_interactivo(resp, total_pl)
+                        if not continuar or not rango_sel:
+                            print("Operación cancelada por el usuario.")
+                            return None, []
+                        d_sel, h_sel = rango_sel
+                        if d_sel != 1 or h_sel != total_pl:
+                            videos_pl = [v for v in videos_pl if d_sel <= v[0] <= h_sel]
+                            print(f"🎯 Selección aplicada: {len(videos_pl)} videos (del {d_sel} al {h_sel}).")
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nOperación cancelada.")
+                        return None, []
+                elif es_interactivo and len(entradas_crudas) == 1:
+                    try:
+                        pregunta = f"👉 ¿Procesar los {total_pl} videos detectados en el rango {rango_txt}? (S/n): "
+                        resp = input(pregunta).strip().lower()
+                        if resp not in ["", "s", "si", "sí", "y", "yes"]:
+                            print("Operación cancelada por el usuario.")
+                            return None, []
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nOperación cancelada.")
+                        return None, []
+
+                max_pos = max([v[0] for v in videos_pl], default=total_pl)
+                ancho = 3 if max_pos >= 100 else 2
+
+                for p_idx, vid, _ in videos_pl:
+                    prefix_id = f"{p_idx:0{ancho}d}"
+                    video_url = f"https://www.youtube.com/watch?v={vid}"
+                    lista_final.append((prefix_id, video_url))
+
+            except Exception as e:
+                logger.error(f"Error al procesar playlist '{url}': {e}")
+                try:
+                    single_id = extraer_id_video(url)
+                    print(f"⚠️ Falló la playlist ({e}). Procesando únicamente el video individual detectado: {single_id}")
+                    lista_final.append((cid_orig, f"https://www.youtube.com/watch?v={single_id}"))
+                except Exception:
+                    print(f"❌ No se pudo procesar la URL de playlist: {e}")
+        else:
+            lista_final.append((cid_orig, url))
+
+    return materia_sugerida, lista_final
+
+
+def escanear_videos_procesados(directorio_materia: str) -> Dict[str, str]:
+    """
+    Escanea la carpeta destino buscando qué video_id ya fueron procesados.
+    Revisa archivos *_transcripcion.txt y *.md.
+    Devuelve diccionario {video_id: nombre_archivo}.
+    """
+    if not os.path.exists(directorio_materia):
+        return {}
+
+    procesados: Dict[str, str] = {}
+    patron_id_url = re.compile(r'watch\?v=([0-9A-Za-z_-]{11})|youtu\.be\/([0-9A-Za-z_-]{11})')
+
+    for nombre in os.listdir(directorio_materia):
+        ruta = os.path.join(directorio_materia, nombre)
+        if not os.path.isfile(ruta):
+            continue
+
+        if nombre.endswith("_transcripcion.txt") or nombre.endswith(".md"):
+            try:
+                with open(ruta, "r", encoding="utf-8", errors="ignore") as f:
+                    primeras_lineas = "".join([f.readline() for _ in range(30)])
+                    m = patron_id_url.search(primeras_lineas)
+                    if m:
+                        vid = m.group(1) or m.group(2)
+                        procesados[vid] = nombre
+            except Exception:
+                pass
+
+    return procesados
 
 
 def extraer_id_video(url_o_id: str) -> str:
@@ -61,12 +425,12 @@ def obtener_titulo_video(video_id: str) -> str:
 
     # Fallback con yt-dlp si está instalado
     try:
-        res = subprocess.run(
+        retcode, stdout_tit, _ = ejecutar_subproceso_texto(
             ["yt-dlp", "--print", "title", "--skip-download", f"https://www.youtube.com/watch?v={video_id}"],
-            capture_output=True, text=True, encoding='utf-8', timeout=15
+            timeout=15
         )
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
+        if retcode == 0 and stdout_tit.strip():
+            return stdout_tit.strip()
     except Exception:
         pass
 
@@ -74,15 +438,15 @@ def obtener_titulo_video(video_id: str) -> str:
 
 
 def obtener_transcripcion(video_id: str) -> str:
-    """Descarga la transcripción del video en español o traduce si está en otro idioma."""
+    """Descarga la transcripción del video en español o traduce si está en otro idioma con reintentos."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except ImportError:
         raise RuntimeError("La librería 'youtube-transcript-api' no está instalada. Ejecutá: pip install -r requirements.txt")
 
     api = YouTubeTranscriptApi()
-    
-    try:
+
+    def _descargar_api() -> str:
         tl = api.list(video_id)
         # Intentar obtener español (manual o autogenerado), o inglés
         try:
@@ -95,18 +459,24 @@ def obtener_transcripcion(video_id: str) -> str:
                 
         datos = transcript.fetch().to_raw_data()
         lineas = [item['text'].strip() for item in datos if item.get('text')]
-        texto_completo = " ".join(lineas)
-        return texto_completo
+        return " ".join(lineas)
+
+    try:
+        return reintentar_con_backoff(
+            _descargar_api,
+            max_intentos=2,
+            base_delay=2.0,
+            descripcion=f"obtención de transcripción API ({video_id})"
+        )
     except Exception as e:
         # Fallback con yt-dlp si la API de transcripciones falla
-        print(f"Aviso: Falló youtube-transcript-api ({e}). Intentando con yt-dlp...")
+        logger.warning(f"Aviso: Falló youtube-transcript-api ({e}). Intentando con yt-dlp...")
         try:
-            vtt_file = f"sub_temp_{video_id}.es.vtt"
-            subprocess.run([
+            ejecutar_subproceso_texto([
                 "yt-dlp", "--write-auto-sub", "--write-sub", "--sub-lang", "es,en",
                 "--skip-download", "-o", f"sub_temp_{video_id}.%(ext)s",
                 f"https://www.youtube.com/watch?v={video_id}"
-            ], capture_output=True, text=True, timeout=30)
+            ], timeout=30)
             
             # Buscar archivo de subtítulos generado
             for arch in os.listdir("."):
@@ -117,8 +487,8 @@ def obtener_transcripcion(video_id: str) -> str:
                     # Limpieza básica de formato VTT
                     lineas_vtt = re.sub(r'<[^>]+>', '', contenido)
                     lineas_vtt = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', lineas_vtt)
-                    lineas_vtt = [l.strip() for l in lineas_vtt.splitlines() if l.strip() and not l.strip().isdigit() and 'WEBVTT' not in l]
-                    return " ".join(lineas_vtt)
+                    lineas_filtradas = [linea.strip() for linea in lineas_vtt.splitlines() if linea.strip() and not linea.strip().isdigit() and 'WEBVTT' not in linea]
+                    return " ".join(lineas_filtradas)
         except Exception as fallback_error:
             raise RuntimeError(f"No se pudo obtener la transcripción del video: {fallback_error}")
 
@@ -165,8 +535,18 @@ def cargar_prompt_base() -> str:
 Transformá la transcripción en un apunte claro, completo y bien organizado en formato Markdown, con título, secciones por temas, notas aclaratorias (📌 Nota aclaratoria), resumen y preguntas de repaso."""
 
 
-def generar_apunte_gemini(titulo_video: str, transcripcion: str, modelo: str = None, esfuerzo: str = "low") -> str:
-    """Envía el prompt ensamblado a Gemini CLI (agy) o SDK para procesar el apunte."""
+def generar_apunte_gemini(
+    titulo_video: str,
+    transcripcion: str,
+    modelo: Optional[str] = None,
+    esfuerzo: str = "low",
+    timeout_segundos: int = 300,
+    max_reintentos: int = 3
+) -> str:
+    """
+    Envía el prompt ensamblado a Gemini CLI (agy) o SDK para procesar el apunte.
+    Implementa control de esfuerzo (--effort), timeout configurable y reintentos con backoff exponencial.
+    """
     prompt_base = cargar_prompt_base()
     prompt_completo = f"""{prompt_base}
 
@@ -176,168 +556,98 @@ Título del video: {titulo_video}
 Transcripción del video:
 {transcripcion}
 """
-    # Si GEMINI_API_KEY está configurada, usar google-genai
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if api_key:
-        try:
-            from google import genai
-            print("[INFO] Generando apunte con SDK google-genai (GEMINI_API_KEY detectada)...")
-            client = genai.Client(api_key=api_key)
-            model_name = modelo or "gemini-2.5-flash"
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt_completo
-            )
-            return response.text
-        except Exception as e:
-            print(f"[AVISO] Falló el SDK directo ({e}). Intentando con agy CLI...")
 
-    # Por defecto, invocar agy CLI
-    print(f"[INFO] Generando apunte con Gemini CLI (`agy`)...")
-    
-    # Usar archivo temporal para pasar el prompt completo a agy con @archivo
-    # Esto evita el límite de 32KB en la línea de comandos de Windows sin truncar texto
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
-        tf.write(prompt_completo)
-        temp_prompt_path = tf.name
-
-    try:
-        cmd = ["agy", "-p", f"@{temp_prompt_path}", "--disable-slash-commands"]
-        if modelo:
-            cmd.extend(["--model", modelo])
-        if esfuerzo:
-            cmd.extend(["--effort", esfuerzo])
-
-        proceso = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
-    finally:
-        if os.path.exists(temp_prompt_path):
+    def _invocar() -> str:
+        # Si GEMINI_API_KEY está configurada, usar google-genai
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key:
             try:
-                os.remove(temp_prompt_path)
-            except OSError:
-                pass
-    
-    if proceso.returncode != 0:
-        raise RuntimeError(f"Error al ejecutar agy: {proceso.stderr.strip()}")
-    
-    resultado = proceso.stdout.strip()
-    if not resultado:
-        raise RuntimeError("La llamada a Gemini CLI no devolvió contenido.")
-    
-    # Limpiar bloques envolventes de markdown si los hubiera
-    if resultado.startswith("```markdown") and resultado.endswith("```"):
-        resultado = resultado[11:-3].strip()
-    elif resultado.startswith("```md") and resultado.endswith("```"):
-        resultado = resultado[5:-3].strip()
+                from google import genai
+                logger.info("Generando apunte con SDK google-genai (GEMINI_API_KEY detectada)...")
+                client = genai.Client(api_key=api_key)
+                model_name = modelo or "gemini-2.5-flash"
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt_completo
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                logger.warning(f"Aviso: Falló el SDK directo ({e}). Intentando con agy CLI...")
 
-    return resultado
-
-
-def exportar_a_pdf(contenido_markdown: str, ruta_salida_pdf: str, titulo: str = "Apunte", directorio_base: str = "."):
-    """
-    Convierte el apunte Markdown a PDF con maquetación visual profesional mediante enriquecedor_visual.
-    Implementa un compilador inteligente de dos pasadas:
-    1. Compila un borrador y analiza la geometría de cada figura con PyMuPDF.
-    2. Si detecta que una figura quedó comprimida contra el borde inferior de una página (ancho < 320pt),
-       inyecta automáticamente un salto de página para esa figura específica y compila la versión final.
-    """
-    try:
-        from markdown_pdf import MarkdownPdf, Section
-        import fitz
-    except ImportError:
-        raise RuntimeError("Las librerías 'markdown-pdf' o 'pymupdf' no están instaladas.")
-
-    # Procesar diagramas Mermaid con tema visual pro e incrustar todas las imágenes en Base64
-    md_para_pdf = enriquecedor_visual.preparar_markdown_para_pdf(contenido_markdown, directorio_base=directorio_base)
-
-    def _compilar(md_texto: str, destino_path: str):
-        pdf = MarkdownPdf(toc_level=2, optimize=True)
-        pdf.meta["title"] = titulo
-        pdf.meta["creator"] = "Generador de Apuntes con Gemini CLI y Enriquecedor Visual"
-        seccion = Section(
-            md_texto,
-            toc=True,
-            paper_size="A4",
-            borders=(36, 36, -36, -36)
-        )
-        pdf.add_section(seccion, user_css=enriquecedor_visual.CSS_VISUAL_ACADEMICO)
-        pdf.save(destino_path)
-
-    # Identificador de figuras en el markdown procesado
-    patron_figura = re.compile(
-        r'(<div class="figura-diagrama-contenedor"[^>]*>\s*<img [^>]*alt="Figura (\d+):)'
-    )
-
-    # Si no hay figuras con diagramas en el contenido, compilar directo
-    if not patron_figura.search(md_para_pdf):
-        _compilar(md_para_pdf, ruta_salida_pdf)
-        return
-
-    # Bucle de optimización de saltos de página (hasta 5 pasadas para convergencia total)
-    todas_aplastadas = set()
-    md_actual = md_para_pdf
-    MAX_PASADAS = 5
-
-    for pasada in range(1, MAX_PASADAS + 1):
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
-            temp_pdf_path = tf.name
+        # Por defecto, invocar agy CLI
+        logger.info(f"Generando apunte con Gemini CLI (`agy`)... (timeout: {timeout_segundos}s, effort: {esfuerzo})")
+        
+        # Usar archivo temporal para pasar el prompt completo a agy con @archivo
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
+            tf.write(prompt_completo)
+            temp_prompt_path = tf.name
 
         try:
-            _compilar(md_actual, temp_pdf_path)
+            cmd = ["agy", "-p", f"@{temp_prompt_path}", "--disable-slash-commands"]
+            if modelo:
+                cmd.extend(["--model", modelo])
+            if esfuerzo and esfuerzo.lower() != "none":
+                cmd.extend(["--effort", esfuerzo])
 
-            doc = fitz.open(temp_pdf_path)
-            nuevas_aplastadas = set()
-            img_counter = 0
-
-            for p_idx in range(len(doc)):
-                page = doc[p_idx]
-                imgs = page.get_images()
-                for img in imgs:
-                    xref = img[0]
-                    rects = page.get_image_rects(xref)
-                    if not rects:
-                        continue
-                    w = rects[0].width
-                    # Ignorar la portada oficial en la primera página
-                    if p_idx == 0 and img_counter == 0:
-                        img_counter += 1
-                        continue
-                    img_counter += 1
-                    # Si el ancho renderizado es menor a 350pt (en una página de 500pt utilizable),
-                    # la figura fue estrangulada verticalmente por el pie de página
-                    if w < 350:
-                        nuevas_aplastadas.add(img_counter - 1)
-
-            doc.close()
-
-            # Si no hay nuevas figuras aplastadas o alcanzamos el límite, este PDF es el definitivo
-            if not nuevas_aplastadas or pasada == MAX_PASADAS:
-                if os.path.exists(ruta_salida_pdf):
-                    try:
-                        os.remove(ruta_salida_pdf)
-                    except OSError:
-                        pass
-                os.replace(temp_pdf_path, ruta_salida_pdf)
-                break
-
-            todas_aplastadas.update(nuevas_aplastadas)
-            print(f"[INFO] Optimizador visual (Pasada {pasada}): Reajustando saltos de página en figuras: {sorted(todas_aplastadas)}")
-
-            # Inyectar saltos de página antes de las figuras afectadas
-            def _inyectar_salto(match):
-                num_fig = int(match.group(2))
-                bloque = match.group(1)
-                if num_fig in todas_aplastadas:
-                    return f'<div style="page-break-before: always; break-before: page;"></div>\n{bloque}'
-                return bloque
-
-            md_actual = patron_figura.sub(_inyectar_salto, md_para_pdf)
-
+            retcode, salida, err = ejecutar_subproceso_texto(cmd, timeout=timeout_segundos)
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout al ejecutar agy superó el límite de {timeout_segundos} segundos.")
+            raise TimeoutError(f"agy CLI no respondió dentro del límite de {timeout_segundos}s.")
         finally:
-            if os.path.exists(temp_pdf_path):
+            if os.path.exists(temp_prompt_path):
                 try:
-                    os.remove(temp_pdf_path)
+                    os.remove(temp_prompt_path)
                 except OSError:
                     pass
+        
+        if retcode != 0:
+            raise RuntimeError(f"Error al ejecutar agy (código {retcode}): {err.strip()}")
+        
+        resultado = salida.strip()
+        if not resultado:
+            raise RuntimeError("La llamada a Gemini CLI no devolvió contenido.")
+        
+        # Limpiar bloques envolventes de markdown si los hubiera
+        if resultado.startswith("```markdown") and resultado.endswith("```"):
+            resultado = resultado[11:-3].strip()
+        elif resultado.startswith("```md") and resultado.endswith("```"):
+            resultado = resultado[5:-3].strip()
+
+        return resultado
+
+    return reintentar_con_backoff(
+        _invocar,
+        max_intentos=max_reintentos,
+        base_delay=3.0,
+        max_delay=30.0,
+        descripcion=f"generación de apunte IA ({titulo_video[:30]})",
+        excepciones_reintentables=(RuntimeError, TimeoutError, Exception)
+    )
+
+
+def exportar_a_pdf(
+    contenido_markdown: str,
+    ruta_salida_pdf: str,
+    titulo: str = "Apunte",
+    directorio_base: str = ".",
+    materia: str = "General",
+    url_fuente: str = ""
+) -> str:
+    """
+    Convierte el apunte Markdown a PDF profesional mediante compilador_pdf.
+    Aplica WeasyPrint (o fallback transparente a markdown-pdf si GTK3 no está disponible),
+    portada de cortesía, encabezados dinámicos, 'Página X de Y', TOC y reglas anti-rotura.
+    """
+    import compilador_pdf
+    return compilador_pdf.compilar_pdf(
+        contenido_markdown=contenido_markdown,
+        ruta_pdf=ruta_salida_pdf,
+        titulo=titulo,
+        materia=materia,
+        url_fuente=url_fuente,
+        directorio_base=directorio_base
+    )
 
 
 def extraer_id_y_url(linea: str) -> Tuple[Optional[str], Optional[str]]:
@@ -405,6 +715,8 @@ def procesar_un_video(
     carpeta_destino: str,
     generar_pdf: bool = False,
     modelo: Optional[str] = None,
+    esfuerzo: str = "low",
+    timeout: int = 300,
     guardar_transcripcion: bool = True,
     es_lote: bool = False
 ) -> Dict:
@@ -451,6 +763,8 @@ def procesar_un_video(
             with open(ruta_transcripcion, "w", encoding="utf-8") as f:
                 f.write(f"Título: {titulo_video}\nURL: https://www.youtube.com/watch?v={video_id}\n\n{transcripcion}")
             print(f"      Transcripción guardada en: {ruta_transcripcion}")
+        else:
+            print("      (Omitiendo guardado de archivo de transcripción por --no-transcripcion)")
 
         # 5. Generar apunte con Gemini
         print("[5/5] Procesando apunte con Gemini...")
@@ -458,7 +772,8 @@ def procesar_un_video(
             titulo_video=titulo_video,
             transcripcion=transcripcion,
             modelo=modelo,
-            esfuerzo="low"
+            esfuerzo=esfuerzo,
+            timeout_segundos=timeout
         )
 
         # Insertar portada visual en el apunte si fue descargada
@@ -478,13 +793,15 @@ def procesar_un_video(
             ruta_pdf = os.path.join(carpeta_destino, f"{nombre_base}.pdf")
             print(f"📄 Compilando PDF con maquetación visual: {ruta_pdf}...")
             try:
-                exportar_a_pdf(
+                motor_usado = exportar_a_pdf(
                     contenido_md,
                     ruta_pdf,
                     titulo=f"{id_apunte} - {titulo_video}",
-                    directorio_base=carpeta_destino
+                    directorio_base=carpeta_destino,
+                    materia=os.path.basename(carpeta_destino),
+                    url_fuente=url
                 )
-                print(f"✅ Archivo PDF generado exitosamente: {ruta_pdf}")
+                print(f"✅ Archivo PDF generado exitosamente [{motor_usado.upper()}]: {ruta_pdf}")
             except Exception as e:
                 print(f"⚠️ No se pudo generar el PDF: {e}")
 
@@ -497,15 +814,25 @@ def procesar_un_video(
 
 def main():
     parser = argparse.ArgumentParser(description="Generador automatizado de apuntes desde videos de YouTube.")
-    parser.add_argument("--url", "-u", nargs="*", type=str, help="Una o más URLs o IDs de videos de YouTube")
+    parser.add_argument("urls_posicionales", nargs="*", default=[], help="Una o más URLs o IDs de videos de YouTube o playlists (opcional, argumento posicional)")
+    parser.add_argument("--url", "-u", nargs="*", type=str, help="Una o más URLs o IDs de videos de YouTube o playlists")
     parser.add_argument("--urls-file", "--file", "-f", type=str, default=None, help="Ruta a archivo .txt con lista de URLs")
     parser.add_argument("--materia", "--tema", "--apunte", "-m", dest="materia", type=str, help="Nombre del apunte o materia (ej. matematica, fisica)")
     parser.add_argument("--dir-apuntes", "--output-dir", type=str, default="apuntes", help="Directorio base para los apuntes (por defecto: apuntes)")
     parser.add_argument("--pdf", action="store_true", help="Generar también el apunte en formato PDF")
     parser.add_argument("--model", type=str, default=None, help="Modelo de Gemini a utilizar (ej. gemini-3.8-flash-low)")
-    parser.add_argument("--guardar-transcripcion", action="store_true", default=True, help="Guardar la transcripción original en texto")
+    parser.add_argument("--effort", type=str, choices=["low", "medium", "high", "none"], default="low", help="Nivel de esfuerzo de razonamiento para agy (low, medium, high, none; por defecto: low)")
+    parser.add_argument("--timeout", type=int, default=300, help="Tiempo máximo de espera en segundos para la llamada a agy / IA (por defecto: 300)")
+    parser.add_argument("--desde", type=int, default=None, help="Índice inicial de la playlist a procesar (ej. --desde 11)")
+    parser.add_argument("--hasta", type=int, default=None, help="Índice final de la playlist a procesar (ej. --hasta 20)")
+    parser.add_argument("--video-only", action="store_true", help="Forzar el procesamiento de solo un video si la URL incluye parámetro list=")
+    parser.add_argument("--no-transcripcion", dest="guardar_transcripcion", action="store_false", help="Omitir el guardado del archivo de transcripción (.txt)")
+    parser.add_argument("--guardar-transcripcion", dest="guardar_transcripcion", action="store_true", default=True, help="Guardar la transcripción original en texto (activo por defecto)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Activar registro detallado (debug)")
 
     args = parser.parse_args()
+
+    configurar_logging(verbose=args.verbose)
 
     print("=" * 65)
     print(" 🎓 GENERADOR DE APUNTES DE YOUTUBE CON GEMINI CLI (AGY)")
@@ -513,26 +840,33 @@ def main():
 
     directorio_script = os.path.dirname(os.path.abspath(__file__))
     ruta_urls_txt = os.path.join(directorio_script, "urls.txt")
-    lista_videos: List[Tuple[Optional[str], str]] = []
+    lista_cruda: List[Tuple[Optional[str], str]] = []
+    es_interactivo_directo = False
 
     # 1. Determinar lista de videos (CLI o interactivo)
+    urls_cli: List[str] = []
+    if args.url:
+        urls_cli.extend(args.url)
+    if args.urls_posicionales:
+        urls_cli.extend(args.urls_posicionales)
+
     if args.urls_file:
-        lista_videos = leer_urls_desde_archivo(args.urls_file)
-        if not lista_videos:
+        lista_cruda = leer_urls_desde_archivo(args.urls_file)
+        if not lista_cruda:
             print(f"❌ Error: No se encontraron URLs válidas en '{args.urls_file}'.")
             return
-    elif args.url:
-        for item in args.url:
+    elif urls_cli:
+        for item in urls_cli:
             cid, curl = extraer_id_y_url(item)
             if curl:
-                lista_videos.append((cid, curl))
+                lista_cruda.append((cid, curl))
     else:
         # Modo interactivo
-        # Comprobar si urls.txt tiene contenido activo
+        es_interactivo_directo = True
         urls_en_archivo = leer_urls_desde_archivo(ruta_urls_txt)
         usar_urls_txt = False
         if urls_en_archivo:
-            print(f"\n📄 Se detectaron {len(urls_en_archivo)} video(s) configurados en 'urls.txt':")
+            print(f"\n📄 Se detectaron {len(urls_en_archivo)} entrada(s) configurada(s) en 'urls.txt':")
             for i, (cid, curl) in enumerate(urls_en_archivo[:5], 1):
                 pref = f"[{cid}] " if cid else ""
                 print(f"   {i}. {pref}{curl}")
@@ -540,18 +874,18 @@ def main():
                 print(f"   ... y {len(urls_en_archivo) - 5} más.")
 
             try:
-                opc = input(f"\n👉 ¿Deseás procesar los {len(urls_en_archivo)} videos de 'urls.txt'? (S/n): ").strip().lower()
+                opc = input("\n👉 ¿Deseás procesar las entradas de 'urls.txt'? (S/n): ").strip().lower()
                 if opc in ["", "s", "si", "sí", "y", "yes"]:
-                    lista_videos = urls_en_archivo
+                    lista_cruda = urls_en_archivo
                     usar_urls_txt = True
             except (KeyboardInterrupt, EOFError):
                 print("\nOperación cancelada.")
                 return
 
         if not usar_urls_txt:
-            print("\n👉 Ingresá la URL del video de YouTube.")
-            print("   (Podés ingresar una URL, varias separadas por coma, la ruta a un archivo .txt,")
-            print("    o incluir número/clase ej: 'clase 1 -> https://...'):")
+            print("\n👉 Ingresá la URL del video o de la Playlist de YouTube.")
+            print("   (Podés ingresar una URL, una playlist, varias separadas por coma,")
+            print("    la ruta a un archivo .txt, o incluir número ej: 'clase 1 -> https://...'):")
             try:
                 entrada_usuario = input("🔗 URL o archivo: ").strip()
             except (KeyboardInterrupt, EOFError):
@@ -562,36 +896,62 @@ def main():
                 print("❌ Error: No se ingresó ninguna URL.")
                 return
 
-            # Si ingresó una ruta a un archivo de texto existente
             if os.path.isfile(entrada_usuario):
-                lista_videos = leer_urls_desde_archivo(entrada_usuario)
+                lista_cruda = leer_urls_desde_archivo(entrada_usuario)
             elif "\n" in entrada_usuario:
-                for l in entrada_usuario.splitlines():
-                    cid, curl = extraer_id_y_url(l)
+                for linea in entrada_usuario.splitlines():
+                    cid, curl = extraer_id_y_url(linea)
                     if curl:
-                        lista_videos.append((cid, curl))
+                        lista_cruda.append((cid, curl))
             elif "," in entrada_usuario:
-                for l in entrada_usuario.split(","):
-                    cid, curl = extraer_id_y_url(l)
+                for linea in entrada_usuario.split(","):
+                    cid, curl = extraer_id_y_url(linea)
                     if curl:
-                        lista_videos.append((cid, curl))
+                        lista_cruda.append((cid, curl))
             else:
                 cid, curl = extraer_id_y_url(entrada_usuario)
                 if curl:
-                    lista_videos.append((cid, curl))
+                    lista_cruda.append((cid, curl))
+
+    if not lista_cruda:
+        print("❌ Error: No se pudieron extraer URLs válidas para procesar.")
+        return
+
+    # Expandir playlists a videos si corresponde
+    materia_sugerida, lista_videos = resolver_y_expandir_entradas(
+        entradas_crudas=lista_cruda,
+        video_only=args.video_only,
+        desde=args.desde,
+        hasta=args.hasta,
+        es_interactivo=es_interactivo_directo
+    )
 
     if not lista_videos:
-        print("❌ Error: No se pudieron extraer URLs válidas para procesar.")
+        print("❌ Error: No hay videos seleccionados para procesar.")
         return
 
     # 2. Solicitar nombre de la categoría o materia
     materia_input = args.materia
     if not materia_input:
-        try:
-            materia_input = input("\n👉 Ingresá el nombre del apunte o materia (ej: bettatech, teoria_de_juegos): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nOperación cancelada.")
-            return
+        if materia_sugerida:
+            sug_slug = sanitizar_nombre(materia_sugerida, max_len=30)
+            if not es_interactivo_directo:
+                materia_input = sug_slug
+            else:
+                try:
+                    prompt_mat = f"\n👉 Ingresá el nombre del apunte o materia [Enter para usar '{sug_slug}']: "
+                    materia_input = input(prompt_mat).strip()
+                    if not materia_input:
+                        materia_input = sug_slug
+                except (KeyboardInterrupt, EOFError):
+                    print("\nOperación cancelada.")
+                    return
+        else:
+            try:
+                materia_input = input("\n👉 Ingresá el nombre del apunte o materia (ej: bettatech, teoria_de_juegos): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperación cancelada.")
+                return
 
     if not materia_input:
         materia_input = "general"
@@ -628,10 +988,28 @@ def main():
     else:
         print(f"\nCarpeta destino: ./{ruta_mostrar}/")
 
+    # Escaneo de videos ya existentes en carpeta destino (Deduplicación)
+    ya_procesados = escanear_videos_procesados(carpeta_destino)
+    if ya_procesados:
+        logger.info(f"📂 Archivos existentes detectados en carpeta: {len(ya_procesados)}")
+
     exitosos = []
+    salteados = []
     fallidos = []
 
     for idx, (cid, curl) in enumerate(lista_videos, start=1):
+        try:
+            vid = extraer_id_video(curl)
+        except Exception:
+            vid = None
+
+        if vid and vid in ya_procesados:
+            arch_existente = ya_procesados[vid]
+            tag_id = f"[{cid}] " if cid else ""
+            print(f"\n⏭️ [{idx}/{total_videos}] {tag_id}Ya procesado anteriormente ({vid} -> {arch_existente}), salteando...")
+            salteados.append({"url": curl, "video_id": vid, "archivo": arch_existente, "id_apunte": cid})
+            continue
+
         if es_lote:
             tag_id = f" (ID: {cid})" if cid else " (ID: automático)"
             print("\n" + "-" * 65)
@@ -644,12 +1022,16 @@ def main():
             carpeta_destino=carpeta_destino,
             generar_pdf=generar_pdf,
             modelo=args.model,
+            esfuerzo=args.effort,
+            timeout=args.timeout,
             guardar_transcripcion=args.guardar_transcripcion,
             es_lote=es_lote
         )
 
         if resultado["status"] == "ok":
             exitosos.append(resultado)
+            if vid:
+                ya_procesados[vid] = f"{resultado['nombre_base']}.md"
         else:
             fallidos.append(resultado)
 
@@ -666,6 +1048,11 @@ def main():
         for item in exitosos:
             print(f"    • {item['nombre_base']} ({item['titulo'][:50]})")
 
+        if salteados:
+            print(f"\n ⏭️ Salteados (ya existían): {len(salteados)} de {total_videos}")
+            for item in salteados:
+                print(f"    • [{item.get('id_apunte') or '-'}] {item['video_id']} ({item['archivo']})")
+
         if fallidos:
             print(f"\n ❌ Fallidos: {len(fallidos)} de {total_videos}")
             for item in fallidos:
@@ -675,6 +1062,8 @@ def main():
     else:
         if exitosos:
             print(f" 🎉 ¡Proceso finalizado! Los archivos están listos en: ./{ruta_mostrar}/")
+        elif salteados:
+            print(f" ⏭️ El video ya había sido procesado previamente en: ./{ruta_mostrar}/{salteados[0]['archivo']}")
         else:
             print(" ❌ No se pudo completar el apunte.")
     print("=" * 65)
